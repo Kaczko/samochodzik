@@ -359,6 +359,64 @@ class Pedestrian:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  PARKED CAR  (physical obstacle with OBB collision)
+# ═══════════════════════════════════════════════════════════════════════════════
+class ParkedCar:
+    def __init__(self, cx, cy, w, h, angle_deg, color):
+        self.x     = cx
+        self.y     = cy
+        self.w     = w          # width  (across)
+        self.h     = h          # height (along heading)
+        self.angle = angle_deg
+        self.color = color
+        self.collision = False
+        self.col_timer = 0
+
+    @property
+    def fwd(self):
+        a = math.radians(self.angle)
+        return math.cos(a), math.sin(a)
+
+    @property
+    def rgt(self):
+        fx, fy = self.fwd
+        return -fy, fx
+
+    def corners(self):
+        fx, fy = self.fwd
+        rx, ry = self.rgt
+        hw, hl = self.w / 2, self.h / 2
+        return [
+            (self.x + fx*hl + rx*hw, self.y + fy*hl + ry*hw),
+            (self.x + fx*hl - rx*hw, self.y + fy*hl - ry*hw),
+            (self.x - fx*hl - rx*hw, self.y - fy*hl - ry*hw),
+            (self.x - fx*hl + rx*hw, self.y - fy*hl + ry*hw),
+        ]
+
+    def update(self):
+        if self.col_timer > 0:
+            self.col_timer -= 1
+            if self.col_timer == 0:
+                self.collision = False
+
+
+def build_parked_cars():
+    """Build the list of physical parked car objects from occupied spots."""
+    cars = []
+    for i in occ_top:
+        if i < N_SPOTS:
+            cx = START_X + i * SPOT_W + SPOT_W // 2
+            cy = ROW1_Y + SPOT_H // 2
+            cars.append(ParkedCar(cx, cy, SPOT_W - 10, SPOT_H - 14, 90, top_colors[i]))
+    for i in occ_bot:
+        if i < N_SPOTS:
+            cx = START_X + i * SPOT_W + SPOT_W // 2
+            cy = ROW2_Y + SPOT_H // 2
+            cars.append(ParkedCar(cx, cy, SPOT_W - 10, SPOT_H - 14, 270, bot_colors[i]))
+    return cars
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  PROJECTION UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 def world_to_cam(wx, wy, car):
@@ -389,14 +447,105 @@ def cam_ground(wx, wy, car):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  COLLISION HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def sat_collide(corners_a, corners_b):
+    """
+    Separating Axis Theorem for two convex polygons.
+    Returns (overlapping, penetration_depth, push_ax, push_ay).
+    push axis is oriented to push A away from B.
+    """
+    min_pen = float('inf')
+    best_ax = (1.0, 0.0)
+
+    def project(corners, ax, ay):
+        dots = [c[0] * ax + c[1] * ay for c in corners]
+        return min(dots), max(dots)
+
+    for corners in (corners_a, corners_b):
+        n = len(corners)
+        for i in range(n):
+            ex = corners[(i + 1) % n][0] - corners[i][0]
+            ey = corners[(i + 1) % n][1] - corners[i][1]
+            length = math.hypot(ex, ey)
+            if length < 1e-9:
+                continue
+            ax, ay = -ey / length, ex / length          # unit normal
+
+            a_lo, a_hi = project(corners_a, ax, ay)
+            b_lo, b_hi = project(corners_b, ax, ay)
+
+            pen = min(a_hi, b_hi) - max(a_lo, b_lo)
+            if pen <= 0:
+                return False, 0.0, 0.0, 0.0
+            if pen < min_pen:
+                min_pen = pen
+                best_ax = (ax, ay)
+
+    # Ensure push axis points from B toward A
+    cax = sum(c[0] for c in corners_a) / len(corners_a)
+    cay = sum(c[1] for c in corners_a) / len(corners_a)
+    cbx = sum(c[0] for c in corners_b) / len(corners_b)
+    cby = sum(c[1] for c in corners_b) / len(corners_b)
+    if (cax - cbx) * best_ax[0] + (cay - cby) * best_ax[1] < 0:
+        best_ax = (-best_ax[0], -best_ax[1])
+
+    return True, min_pen, best_ax[0], best_ax[1]
+
+
+def check_car_collisions(car, parked_cars):
+    """OBB-OBB collision between player car and each parked car."""
+    for pc in parked_cars:
+        pc.update()
+        hit, pen, ax, ay = sat_collide(car.corners(), pc.corners())
+        if hit and pen > 0.5:
+            # Push player car out of the parked car
+            car.x += ax * (pen + 1.0)
+            car.y += ay * (pen + 1.0)
+            if not car.collision:
+                car.speed *= -0.35          # bounce
+            car.collision = True
+            car.col_timer = 60
+            pc.collision  = True
+            pc.col_timer  = 50
+
+
+def nearest_rear_distance(car, peds, parked_cars):
+    """
+    Return world-unit distance (≥ 0) to the nearest obstacle visible in the
+    rear camera arc, or None if nothing is in view.
+    """
+    min_d = None
+
+    # Pedestrians
+    for ped in peds:
+        r = world_to_cam(ped.x, ped.y, car)
+        if r:
+            d = max(0.0, r[2] - ped.R)
+            if min_d is None or d < min_d:
+                min_d = d
+
+    # Parked cars — check all 4 corners and the centre
+    for pc in parked_cars:
+        for wx, wy in pc.corners() + [(pc.x, pc.y)]:
+            r = world_to_cam(wx, wy, car)
+            if r:
+                d = r[2]
+                if min_d is None or d < min_d:
+                    min_d = d
+
+    return min_d   # world units; divide by METER to get metres
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  CAMERA VIEW  (left panel)
 # ═══════════════════════════════════════════════════════════════════════════════
-def draw_camera_view(surf, car, peds):
+def draw_camera_view(surf, car, peds, parked_cars):
     surf.blit(_sky_surf, (0, 0))
     surf.blit(_gnd_surf, (0, HORIZON_Y))
 
     _cam_parking_lines(surf, car)
-    _cam_parked_cars(surf, car)
+    _cam_parked_cars(surf, car, parked_cars)
 
     # Pedestrians: far → near (painter's algorithm)
     visible = []
@@ -408,8 +557,9 @@ def draw_camera_view(surf, car, peds):
     for depth, ped, sx in visible:
         _cam_pedestrian(surf, sx, depth, ped)
 
+    nearest_d = nearest_rear_distance(car, peds, parked_cars)
     _cam_guidelines(surf, car)
-    _cam_hud(surf, car)
+    _cam_hud(surf, car, nearest_d)
 
 
 # ── camera helpers ─────────────────────────────────────────────────────────────
@@ -449,18 +599,10 @@ def _cam_parking_lines(surf, car):
             pygame.draw.line(surf, dim_y, p1, p2, 2)
 
 
-def _cam_parked_cars(surf, car):
-    for i in occ_top:
-        if i >= N_SPOTS: continue
-        cx = START_X + i * SPOT_W + SPOT_W // 2
-        cy = ROW1_Y + SPOT_H // 2
-        _cam_box(surf, car, cx, cy, SPOT_W - 10, SPOT_H - 14, 90, top_colors[i])
-
-    for i in occ_bot:
-        if i >= N_SPOTS: continue
-        cx = START_X + i * SPOT_W + SPOT_W // 2
-        cy = ROW2_Y + SPOT_H // 2
-        _cam_box(surf, car, cx, cy, SPOT_W - 10, SPOT_H - 14, 270, bot_colors[i])
+def _cam_parked_cars(surf, car, parked_cars):
+    for pc in parked_cars:
+        col = RED_HI if pc.collision else pc.color
+        _cam_box(surf, car, pc.x, pc.y, pc.w, pc.h, pc.angle, col)
 
 
 def _cam_box(surf, car, wx, wy, ww, wh, hdg_deg, body_col):
@@ -689,7 +831,7 @@ def _cam_guidelines(surf, car):
             pygame.draw.line(surf, YELLOW, p1, p2, 2)
 
 
-def _cam_hud(surf, car):
+def _cam_hud(surf, car, nearest_d=None):
     if car.collision:
         pygame.draw.rect(surf, RED,  (0, 0, CAM_W, CAM_H), 7)
     else:
@@ -697,28 +839,57 @@ def _cam_hud(surf, car):
 
     # Top bar
     pygame.draw.rect(surf, (5, 6, 16), (0, 0, CAM_W, 50))
-    # Colour accent stripe
     pygame.draw.rect(surf, CYAN, (0, 0, CAM_W, 3))
     surf.blit(font_lg.render("KAMERA COFANIA", True, WHITE), (18, 10))
     surf.blit(font_sm.render("● REC", True, RED_HI), (CAM_W - 65, 18))
 
-    # Distance legend
+    # Distance arc legend (bottom-right)
     for label, col, dy in [("4m", GREEN, 110), ("2m", ORANGE, 90), ("1m", RED, 70)]:
         pygame.draw.rect(surf, col, (CAM_W - 68, CAM_H - dy, 22, 8))
         surf.blit(font_sm.render(label, True, LGRAY),
                   (CAM_W - 42, CAM_H - dy - 2))
 
-    # Speed
+    # ── Nearest obstacle distance readout (bottom centre) ─────────────────────
+    if nearest_d is not None:
+        dm = nearest_d / METER   # convert to real metres
+        if dm <= 0.5:
+            d_col  = RED_HI
+            d_text = "■  STOP!"
+        elif dm < 1.0:
+            d_col  = RED
+            d_text = f"⬌  {dm:.1f} m"
+        elif dm < 2.0:
+            d_col  = ORANGE
+            d_text = f"⬌  {dm:.1f} m"
+        elif dm < 4.0:
+            d_col  = YELLOW
+            d_text = f"⬌  {dm:.1f} m"
+        else:
+            d_col  = GREEN
+            d_text = f"⬌  {dm:.1f} m"
+
+        d_surf = font_lg.render(d_text, True, d_col)
+        dw     = d_surf.get_width()
+        dx     = CAM_W // 2 - dw // 2
+        dy_pos = CAM_H - 55
+        # background pill
+        pygame.draw.rect(surf, (8, 10, 20),
+                         (dx - 14, dy_pos - 6, dw + 28, 42), border_radius=8)
+        pygame.draw.rect(surf, d_col,
+                         (dx - 14, dy_pos - 6, dw + 28, 42), 2, border_radius=8)
+        surf.blit(d_surf, (dx, dy_pos))
+
+    # Speed (bottom-left)
     kmh = int(abs(car.speed) * 15)
     surf.blit(font_md.render(f"{kmh} km/h", True, WHITE), (18, CAM_H - 36))
 
-    # Gear
+    # Gear indicator (bottom-right)
     if   car.speed < -0.08: gear, gc = "R", RED_HI
     elif car.speed >  0.08: gear, gc = "D", GREEN
     else:                   gear, gc = "P", YELLOW
     surf.blit(font_xl.render(gear, True, gc), (CAM_W - 65, CAM_H - 65))
 
-    # Collision flash
+    # Collision warning flash
     if car.collision and (pygame.time.get_ticks() // 280) % 2 == 0:
         warn = font_xl.render("⚠  UWAGA!  KOLIZJA!", True, RED_HI)
         wx   = CAM_W // 2 - warn.get_width() // 2
@@ -744,7 +915,7 @@ def _draw_vignette(surf):
 MAP_SCL = 0.40
 MAP_X0  = CAM_W
 
-def draw_topdown(surf, car, peds):
+def draw_topdown(surf, car, peds, parked_cars):
     cam_wx, cam_wy = car.x, car.y
 
     def w2s(wx, wy):
@@ -816,18 +987,18 @@ def draw_topdown(surf, car, peds):
     for lx, ly in LAMPS:
         _td_lamp(surf, w2s, lx, ly)
 
-    # Parked cars (top row)
-    for i in occ_top:
-        if i < N_SPOTS:
-            cx = START_X + i * SPOT_W + SPOT_W // 2
-            _td_car(surf, w2s, cx, ROW1_Y + SPOT_H // 2,
-                    SPOT_W - 10, SPOT_H - 14, 90, top_colors[i])
-    # Parked cars (bottom row)
-    for i in occ_bot:
-        if i < N_SPOTS:
-            cx = START_X + i * SPOT_W + SPOT_W // 2
-            _td_car(surf, w2s, cx, ROW2_Y + SPOT_H // 2,
-                    SPOT_W - 10, SPOT_H - 14, 270, bot_colors[i])
+    # Parked cars (from physical objects — flash red on collision)
+    for pc in parked_cars:
+        col = RED_HI if pc.collision else pc.color
+        _td_car(surf, w2s, pc.x, pc.y, pc.w, pc.h, pc.angle, col)
+        if pc.collision:
+            # Extra highlight ring
+            px, py = w2s(pc.x, pc.y)
+            hw_s = max(5, int(pc.w / 2 * MAP_SCL))
+            hl_s = max(5, int(pc.h / 2 * MAP_SCL))
+            pygame.draw.ellipse(surf, RED_HI,
+                                (px - hw_s - 3, py - hl_s - 3,
+                                 (hw_s + 3)*2, (hl_s + 3)*2), 2)
 
     # FOV cone
     _td_fov_cone(surf, car, w2s)
@@ -1088,7 +1259,7 @@ def _td_info(surf, car):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  COLLISION DETECTION
+#  PEDESTRIAN COLLISION DETECTION  (OBB vs circle)
 # ═══════════════════════════════════════════════════════════════════════════════
 def check_collisions(car, peds):
     fx, fy = car.fwd
@@ -1129,7 +1300,8 @@ def main():
                 peds.append(p)
                 break
 
-    cam_surf = pygame.Surface((CAM_W, CAM_H))
+    parked_cars = build_parked_cars()
+    cam_surf    = pygame.Surface((CAM_W, CAM_H))
 
     running = True
     while running:
@@ -1149,11 +1321,12 @@ def main():
         for p in peds:
             p.update()
         check_collisions(car, peds)
+        check_car_collisions(car, parked_cars)
 
-        draw_camera_view(cam_surf, car, peds)
+        draw_camera_view(cam_surf, car, peds, parked_cars)
         screen.blit(cam_surf, (0, 0))
 
-        draw_topdown(screen, car, peds)
+        draw_topdown(screen, car, peds, parked_cars)
 
         pygame.draw.line(screen, LGRAY, (CAM_W, 0), (CAM_W, SH), 2)
         pygame.display.flip()
