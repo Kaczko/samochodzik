@@ -320,12 +320,20 @@ class Pedestrian:
         self.dir   = random.uniform(0, 360)
         self.spd   = random.uniform(0.3, 0.9)
         self.timer = random.randint(60, 240)
-        self.hit       = False
-        self.hit_timer = 0
+        self.hit        = False
+        self.hit_timer  = 0
+        self.alive      = True
         # walking phase for leg animation
         self.walk_phase = random.uniform(0, math.pi * 2)
 
     def update(self):
+        # Hit/dying — freeze in place, then vanish
+        if self.hit_timer > 0:
+            self.hit_timer -= 1
+            if self.hit_timer == 0:
+                self.alive = False   # disappear when timer expires
+            return   # stop moving while hit
+
         self.timer -= 1
         if self.timer <= 0:
             self.dir   = random.uniform(0, 360)
@@ -351,11 +359,6 @@ class Pedestrian:
             ny = self.y
 
         self.x, self.y = nx, ny
-
-        if self.hit_timer > 0:
-            self.hit_timer -= 1
-            if self.hit_timer == 0:
-                self.hit = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -519,6 +522,8 @@ def nearest_rear_distance(car, peds, parked_cars):
 
     # Pedestrians
     for ped in peds:
+        if not ped.alive:
+            continue
         r = world_to_cam(ped.x, ped.y, car)
         if r:
             d = max(0.0, r[2] - ped.R)
@@ -550,6 +555,8 @@ def draw_camera_view(surf, car, peds, parked_cars):
     # Pedestrians: far → near (painter's algorithm)
     visible = []
     for ped in peds:
+        if not ped.alive:
+            continue
         r = world_to_cam(ped.x, ped.y, car)
         if r:
             visible.append((r[2], ped, r[0]))
@@ -605,70 +612,163 @@ def _cam_parked_cars(surf, car, parked_cars):
         _cam_box(surf, car, pc.x, pc.y, pc.w, pc.h, pc.angle, col)
 
 
-def _cam_box(surf, car, wx, wy, ww, wh, hdg_deg, body_col):
-    """3-D box (parked car) in camera view, with coloured body, glass strip and roof."""
-    a      = math.radians(hdg_deg)
-    fx, fy = math.cos(a), math.sin(a)
-    rx, ry = -fy, fx
-    hw, hl = ww / 2, wh / 2
+def _project_nc(wx, wy, car):
+    """Project world point to camera screen WITHOUT FOV angle check.
+    Returns (screen_x, depth) or None if the point is behind the camera."""
+    rx, ry   = car.rear
+    dx, dy   = wx - rx, wy - ry
+    a        = math.radians(car.angle)
+    cfx, cfy = -math.cos(a), -math.sin(a)
+    crx, cry =  math.sin(a), -math.cos(a)
+    depth    = dx * cfx + dy * cfy
+    if depth < 2.0:
+        return None
+    lateral  = dx * crx + dy * cry
+    sx       = CAM_W // 2 + int(lateral * FOCAL / depth)
+    return sx, depth
 
-    base_world = [
-        (wx + fx*hl + rx*hw, wy + fy*hl + ry*hw),
-        (wx + fx*hl - rx*hw, wy + fy*hl - ry*hw),
-        (wx - fx*hl - rx*hw, wy - fy*hl - ry*hw),
-        (wx - fx*hl + rx*hw, wy - fy*hl + ry*hw),
+
+def _cam_box(surf, car, wx, wy, ww, wh, hdg_deg, body_col):
+    """
+    Draw a parked car as a 3-D perspective box using per-face quads.
+    Each face is drawn individually (backface culled + painter's algorithm)
+    so the polygon never self-intersects.
+    """
+    a        = math.radians(hdg_deg)
+    pfx, pfy = math.cos(a), math.sin(a)   # parked car forward direction
+    prx, pry = -pfy, pfx                  # parked car right direction
+    hw, hl   = ww / 2, wh / 2
+
+    # 4 ground-plane corners: 0=FR, 1=FL, 2=RL, 3=RR (CCW from above)
+    gw = [
+        (wx + pfx*hl + prx*hw, wy + pfy*hl + pry*hw),  # 0 front-right
+        (wx + pfx*hl - prx*hw, wy + pfy*hl - pry*hw),  # 1 front-left
+        (wx - pfx*hl - prx*hw, wy - pfy*hl - pry*hw),  # 2 rear-left
+        (wx - pfx*hl + prx*hw, wy - pfy*hl + pry*hw),  # 3 rear-right
     ]
 
-    pts_bot, pts_top, pts_win_top, pts_win_bot, depths = [], [], [], [], []
-    for bx, by in base_world:
-        r = world_to_cam(bx, by, car)
-        if r:
-            sx_b, _, dep = r
-            sy_b   = HORIZON_Y + int(GROUND_K / dep)
-            px_h   = max(5, int(FOCAL * 1.55 * METER / dep))
-            win_h  = int(px_h * 0.42)   # glass starts 10% from top, 42% tall
-            pts_bot.append((sx_b, sy_b))
-            pts_top.append((sx_b, sy_b - px_h))
-            pts_win_top.append((sx_b, sy_b - px_h + int(px_h * 0.10)))
-            pts_win_bot.append((sx_b, sy_b - px_h + int(px_h * 0.52)))
-            depths.append(dep)
+    CAR_HEIGHT = 1.55 * METER  # world-unit height
 
-    n = min(len(pts_bot), len(pts_top))
-    if n < 3:
+    # Project each corner (no FOV angle restriction – pygame clips off-screen polys)
+    proj = []
+    for bx, by in gw:
+        p = _project_nc(bx, by, car)
+        if p:
+            sx, dep   = p
+            sy_bot    = HORIZON_Y + int(GROUND_K / dep)
+            px_h      = max(4, int(FOCAL * CAR_HEIGHT / dep))
+            sy_top    = sy_bot - px_h
+            proj.append({'bot': (sx, sy_bot), 'top': (sx, sy_top), 'dep': dep})
+        else:
+            proj.append(None)
+
+    if sum(1 for p in proj if p is not None) < 2:
+        return  # nothing at all visible
+
+    # Coarse reject: car centre must be in front of camera
+    if _project_nc(wx, wy, car) is None:
         return
 
-    try:
-        shade  = tuple(max(0, c - 55) for c in body_col)
-        roof_c = tuple(min(255, c + 20) for c in body_col)
-        glass  = (120, 175, 220)
-        glass2 = (100, 155, 200)
+    # --- Face definitions: (corner_indices, outward_normal_x, outward_normal_y) ---
+    # Faces in CCW winding when viewed from outside
+    face_defs = [
+        ((0, 1), ( pfx,  pfy)),   # front  face, normal = parked-car forward
+        ((1, 2), (-prx, -pry)),   # left   face, normal = -parked-car right
+        ((2, 3), (-pfx, -pfy)),   # rear   face, normal = -parked-car forward
+        ((3, 0), ( prx,  pry)),   # right  face, normal = +parked-car right
+    ]
 
-        # Side body
-        sides = pts_bot[:n] + list(reversed(pts_top[:n]))
-        pygame.draw.polygon(surf, shade, sides)
+    # Direction from parked car centre toward camera rear point
+    crx_p, cry_p = car.rear
+    cam_dx = crx_p - wx
+    cam_dy = cry_p - wy
 
-        # Window glass strip
-        win_sides = pts_win_bot[:n] + list(reversed(pts_win_top[:n]))
-        pygame.draw.polygon(surf, glass, win_sides)
-        # Glass glare (lighter diagonal strip on first face)
-        if n >= 2:
-            glare_pts = [
-                pts_win_top[0],
-                (pts_win_top[0][0] + 4, pts_win_top[0][1]),
-                (pts_win_bot[0][0] + 4, pts_win_bot[0][1]),
-                pts_win_bot[0],
-            ]
-            pygame.draw.polygon(surf, (175, 220, 255), glare_pts)
+    # Simple directional light (upper-right in world space, brightens top/side)
+    LIGHT = (0.6, -0.8)
 
-        # Roof
-        pygame.draw.polygon(surf, roof_c, pts_top[:n])
+    visible_faces = []
+    for (i1, i2), nx, ny in [(fd[0], fd[1][0], fd[1][1]) for fd in face_defs]:
+        # Backface culling: skip faces that point away from the camera
+        if nx * cam_dx + ny * cam_dy <= 0:
+            continue
+        p1, p2 = proj[i1], proj[i2]
+        if p1 is None and p2 is None:
+            continue
+        d1 = p1['dep'] if p1 else 9999
+        d2 = p2['dep'] if p2 else 9999
+        avg_dep = (d1 + d2) / 2
+        visible_faces.append((avg_dep, i1, i2, nx, ny))
 
-        # Outlines
-        pygame.draw.polygon(surf, (20, 22, 32), sides,       1)
-        pygame.draw.polygon(surf, (20, 22, 32), pts_top[:n], 1)
-        pygame.draw.polygon(surf, (60, 70, 85), win_sides,   1)
-    except Exception:
-        pass
+    # Paint far-to-near
+    visible_faces.sort(reverse=True)
+
+    OUTLINE = (18, 20, 30)
+    GLASS   = (110, 170, 215)
+    GLARE   = (170, 215, 255)
+
+    for dep_avg, i1, i2, nx, ny in visible_faces:
+        pa = proj[i1]
+        pb = proj[i2]
+        # If one corner is behind camera, approximate with the other's screen pos
+        if pa is None:
+            pa = pb
+        if pb is None:
+            pb = pa
+        if pa is None or pb is None:
+            continue
+
+        bot1, top1 = pa['bot'], pa['top']
+        bot2, top2 = pb['bot'], pb['top']
+        face_pts   = [bot1, bot2, top2, top1]
+
+        # Diffuse shading per face
+        dot     = nx * LIGHT[0] + ny * LIGHT[1]
+        shade_f = max(0.30, min(1.0, dot * 0.40 + 0.68))
+        shade   = tuple(max(0, int(c * shade_f)) for c in body_col)
+
+        try:
+            pygame.draw.polygon(surf, shade, face_pts)
+        except Exception:
+            continue
+
+        # Windows on side faces (normal mostly perpendicular to parked-car fwd)
+        is_side = abs(nx * pfx + ny * pfy) < 0.4
+        if is_side:
+            # Window: 20–58% from roof (screen-top → screen-bottom)
+            def wy_lerp(bot, top, f):
+                return int(top[1] + (bot[1] - top[1]) * f)
+
+            w_tl = (bot1[0], wy_lerp(bot1, top1, 0.20))
+            w_bl = (bot1[0], wy_lerp(bot1, top1, 0.60))
+            w_tr = (bot2[0], wy_lerp(bot2, top2, 0.20))
+            w_br = (bot2[0], wy_lerp(bot2, top2, 0.60))
+            win_pts = [w_tl, w_tr, w_br, w_bl]
+            try:
+                pygame.draw.polygon(surf, GLASS, win_pts)
+                # Glare stripe on left edge
+                g_w = max(2, abs(bot2[0] - bot1[0]) // 5)
+                glare_pts = [w_tl, (w_tl[0] + g_w, w_tl[1]),
+                             (w_bl[0] + g_w, w_bl[1]), w_bl]
+                pygame.draw.polygon(surf, GLARE, glare_pts)
+                pygame.draw.polygon(surf, (60, 72, 88), win_pts, 1)
+            except Exception:
+                pass
+
+        try:
+            pygame.draw.polygon(surf, OUTLINE, face_pts, 1)
+        except Exception:
+            pass
+
+    # Roof — drawn last so it always appears on top
+    roof_pts = [proj[i]['top'] for i in range(4) if proj[i] is not None]
+    if len(roof_pts) >= 3:
+        shading_top = max(0.55, min(1.0, (-LIGHT[1]) * 0.35 + 0.78))
+        roof_col    = tuple(min(255, int(c * shading_top + 12)) for c in body_col)
+        try:
+            pygame.draw.polygon(surf, roof_col, roof_pts)
+            pygame.draw.polygon(surf, OUTLINE,  roof_pts, 1)
+        except Exception:
+            pass
 
 
 def _cam_pedestrian(surf, sx, depth, ped):
@@ -1005,6 +1105,8 @@ def draw_topdown(surf, car, peds, parked_cars):
 
     # Pedestrians
     for ped in peds:
+        if not ped.alive:
+            continue
         px, py = w2s(ped.x, ped.y)
         r  = max(3, int(ped.R * MAP_SCL))
         fc = RED_HI if ped.hit else ped.color
@@ -1265,6 +1367,8 @@ def check_collisions(car, peds):
     fx, fy = car.fwd
     rx, ry = car.rgt
     for ped in peds:
+        if not ped.alive:
+            continue
         dx  = ped.x - car.x
         dy  = ped.y - car.y
         lon = dx * fx + dy * fy
@@ -1319,7 +1423,8 @@ def main():
         keys = pygame.key.get_pressed()
         car.update(keys)
         for p in peds:
-            p.update()
+            if p.alive:
+                p.update()
         check_collisions(car, peds)
         check_car_collisions(car, parked_cars)
 
